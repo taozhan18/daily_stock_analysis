@@ -4,15 +4,21 @@
 from __future__ import annotations
 
 import logging
+import os
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from api.deps import get_system_config_service
 from api.v1.schemas.common import ErrorResponse
 from api.v1.schemas.system_config import (
+    DiscoverLLMChannelModelsRequest,
+    DiscoverLLMChannelModelsResponse,
+    ExportSystemConfigResponse,
+    ImportSystemConfigRequest,
     SystemConfigConflictResponse,
     SystemConfigResponse,
     SystemConfigSchemaResponse,
+    SetupStatusResponse,
     SystemConfigValidationErrorResponse,
     TestLLMChannelRequest,
     TestLLMChannelResponse,
@@ -21,11 +27,28 @@ from api.v1.schemas.system_config import (
     ValidateSystemConfigRequest,
     ValidateSystemConfigResponse,
 )
-from src.services.system_config_service import ConfigConflictError, ConfigValidationError, SystemConfigService
+from src.services.system_config_service import (
+    ConfigConflictError,
+    ConfigImportError,
+    ConfigValidationError,
+    SystemConfigService,
+)
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+def _ensure_desktop_mode() -> None:
+    """Restrict desktop backup/restore endpoints to desktop runtime only."""
+    if os.getenv("DSA_DESKTOP_MODE", "").strip().lower() != "true":
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "desktop_only_feature",
+                "message": "This endpoint is only available in desktop mode",
+            },
+        )
 
 
 @router.get(
@@ -54,6 +77,35 @@ def get_system_config(
             detail={
                 "error": "internal_error",
                 "message": "Failed to load system configuration",
+            },
+        )
+
+
+@router.get(
+    "/config/setup/status",
+    response_model=SetupStatusResponse,
+    responses={
+        200: {"description": "Setup status loaded"},
+        401: {"description": "Unauthorized", "model": ErrorResponse},
+        500: {"description": "Internal server error", "model": ErrorResponse},
+    },
+    summary="Get first-run setup status",
+    description="Read a side-effect-free setup readiness summary from saved and runtime configuration.",
+)
+def get_setup_status(
+    service: SystemConfigService = Depends(get_system_config_service),
+) -> SetupStatusResponse:
+    """Return first-run setup status without writing config or reloading runtime state."""
+    try:
+        payload = service.get_setup_status()
+        return SetupStatusResponse.model_validate(payload)
+    except Exception as exc:
+        logger.error("Failed to load setup status: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "internal_error",
+                "message": "Failed to load setup status",
             },
         )
 
@@ -108,6 +160,113 @@ def update_system_config(
             detail={
                 "error": "internal_error",
                 "message": "Failed to update system configuration",
+            },
+        )
+
+
+@router.get(
+    "/config/export",
+    response_model=ExportSystemConfigResponse,
+    responses={
+        200: {"description": "Desktop env exported"},
+        401: {"description": "Unauthorized", "model": ErrorResponse},
+        403: {"description": "Desktop mode only", "model": ErrorResponse},
+        500: {"description": "Internal server error", "model": ErrorResponse},
+    },
+    summary="Export desktop env backup",
+    description="Desktop-only endpoint that returns the raw saved .env content.",
+)
+def export_desktop_system_config(
+    service: SystemConfigService = Depends(get_system_config_service),
+) -> ExportSystemConfigResponse:
+    """Export the active `.env` file for desktop backup."""
+    _ensure_desktop_mode()
+    try:
+        payload = service.export_desktop_env()
+        return ExportSystemConfigResponse.model_validate(payload)
+    except Exception as exc:
+        logger.error("Failed to export desktop system configuration: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "internal_error",
+                "message": "Failed to export desktop system configuration",
+            },
+        )
+
+
+@router.post(
+    "/config/import",
+    response_model=UpdateSystemConfigResponse,
+    responses={
+        200: {"description": "Desktop env imported"},
+        400: {
+            "description": "Import failed",
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "anyOf": [
+                            {"$ref": "#/components/schemas/ErrorResponse"},
+                            {"$ref": "#/components/schemas/SystemConfigValidationErrorResponse"},
+                        ]
+                    }
+                }
+            },
+        },
+        401: {"description": "Unauthorized", "model": ErrorResponse},
+        403: {"description": "Desktop mode only", "model": ErrorResponse},
+        409: {"description": "Version conflict", "model": SystemConfigConflictResponse},
+        500: {"description": "Internal server error", "model": ErrorResponse},
+    },
+    summary="Import desktop env backup",
+    description="Desktop-only endpoint that merges raw .env text into the saved configuration.",
+)
+def import_desktop_system_config(
+    request: ImportSystemConfigRequest,
+    service: SystemConfigService = Depends(get_system_config_service),
+) -> UpdateSystemConfigResponse:
+    """Import a desktop `.env` backup into the active config."""
+    _ensure_desktop_mode()
+    try:
+        payload = service.import_desktop_env(
+            config_version=request.config_version,
+            content=request.content,
+            reload_now=request.reload_now,
+        )
+        return UpdateSystemConfigResponse.model_validate(payload)
+    except ConfigImportError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "invalid_import_file",
+                "message": exc.message,
+            },
+        )
+    except ConfigValidationError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "validation_failed",
+                "message": "System configuration validation failed",
+                "issues": exc.issues,
+            },
+        )
+    except ConfigConflictError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "config_version_conflict",
+                "message": "Configuration has changed, please reload and retry",
+                "current_config_version": exc.current_version,
+            },
+        )
+    except Exception as exc:
+        logger.error("Failed to import desktop system configuration: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "internal_error",
+                "message": "Failed to import desktop system configuration",
             },
         )
 
@@ -182,6 +341,50 @@ def test_llm_channel(
             detail={
                 "error": "internal_error",
                 "message": "Failed to test LLM channel",
+            },
+        )
+
+
+@router.post(
+    "/config/llm/discover-models",
+    response_model=DiscoverLLMChannelModelsResponse,
+    responses={
+        200: {"description": "Model discovery completed"},
+        500: {"description": "Internal server error", "model": ErrorResponse},
+    },
+    summary="Discover models for one LLM channel",
+    description="Call one unsaved or saved channel's `/models` endpoint and return discovered model IDs.",
+)
+def discover_llm_channel_models(
+    request: DiscoverLLMChannelModelsRequest,
+    service: SystemConfigService = Depends(get_system_config_service),
+) -> DiscoverLLMChannelModelsResponse:
+    """Discover models for one channel definition without writing `.env`."""
+    try:
+        payload = service.discover_llm_channel_models(
+            name=request.name,
+            protocol=request.protocol,
+            base_url=request.base_url,
+            api_key=request.api_key,
+            models=request.models,
+            timeout_seconds=request.timeout_seconds,
+        )
+        return DiscoverLLMChannelModelsResponse.model_validate(payload)
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "validation_error",
+                "message": str(exc),
+            },
+        )
+    except Exception as exc:
+        logger.error("Failed to discover LLM channel models: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "internal_error",
+                "message": "Failed to discover LLM channel models",
             },
         )
 

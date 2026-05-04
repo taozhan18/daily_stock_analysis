@@ -75,6 +75,12 @@ export interface SystemConfigResponse {
   updatedAt?: string;
 }
 
+export interface ExportSystemConfigResponse {
+  content: string;
+  configVersion: string;
+  updatedAt?: string;
+}
+
 export interface SystemConfigUpdateItem {
   key: string;
   value: string;
@@ -99,6 +105,12 @@ export interface UpdateSystemConfigResponse {
 
 export interface ValidateSystemConfigRequest {
   items: SystemConfigUpdateItem[];
+}
+
+export interface ImportSystemConfigRequest {
+  configVersion: string;
+  content: string;
+  reloadNow?: boolean;
 }
 
 export interface ConfigValidationIssue {
@@ -129,8 +141,34 @@ export interface TestLLMChannelResponse {
   success: boolean;
   message: string;
   error?: string | null;
+  errorCode?: string | null;
+  stage?: string | null;
+  retryable?: boolean | null;
+  details?: Record<string, unknown>;
   resolvedProtocol?: string | null;
   resolvedModel?: string | null;
+  latencyMs?: number | null;
+}
+
+export interface DiscoverLLMChannelModelsRequest {
+  name: string;
+  protocol: string;
+  baseUrl?: string;
+  apiKey?: string;
+  models?: string[];
+  timeoutSeconds?: number;
+}
+
+export interface DiscoverLLMChannelModelsResponse {
+  success: boolean;
+  message: string;
+  error?: string | null;
+  errorCode?: string | null;
+  stage?: string | null;
+  retryable?: boolean | null;
+  details?: Record<string, unknown>;
+  resolvedProtocol?: string | null;
+  models: string[];
   latencyMs?: number | null;
 }
 

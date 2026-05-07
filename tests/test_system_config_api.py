@@ -18,6 +18,7 @@ from api.v1.schemas.system_config import (
     DiscoverLLMChannelModelsRequest,
     ImportSystemConfigRequest,
     TestLLMChannelRequest,
+    TestNotificationChannelRequest,
     UpdateSystemConfigRequest,
 )
 from src.config import Config
@@ -310,6 +311,7 @@ class SystemConfigApiTestCase(unittest.TestCase):
                     base_url="https://api.example.com/v1",
                     api_key="sk-test",
                     models=["gpt-4o-mini"],
+                    capability_checks=["json", "stream"],
                 ),
                 service=self.service,
             ).model_dump()
@@ -317,7 +319,53 @@ class SystemConfigApiTestCase(unittest.TestCase):
         self.assertTrue(payload["success"])
         self.assertEqual(payload["resolved_model"], "openai/gpt-4o-mini")
         self.assertEqual(payload["stage"], "chat_completion")
+        self.assertEqual(payload["capability_results"], {})
         mock_test.assert_called_once()
+        self.assertEqual(mock_test.call_args.kwargs["capability_checks"], ["json", "stream"])
+
+    def test_test_notification_channel_endpoint_returns_service_payload(self) -> None:
+        with patch.object(
+            self.service,
+            "test_notification_channel",
+            return_value={
+                "success": True,
+                "message": "notification ok",
+                "error_code": None,
+                "stage": "notification_send",
+                "retryable": False,
+                "latency_ms": 42,
+                "attempts": [
+                    {
+                        "channel": "wechat",
+                        "success": True,
+                        "message": "sent",
+                        "target": "https://qyapi.example.com/cgi-bin/webhook/send?key=***",
+                        "error_code": None,
+                        "stage": "notification_send",
+                        "retryable": False,
+                        "latency_ms": 42,
+                        "http_status": 200,
+                    }
+                ],
+            },
+        ) as mock_test:
+            payload = system_config.test_notification_channel(
+                request=TestNotificationChannelRequest(
+                    channel="wechat",
+                    items=[{"key": "WECHAT_WEBHOOK_URL", "value": "https://example.com/hook"}],
+                    title="DSA 通知测试",
+                    content="hello",
+                    timeout_seconds=5,
+                ),
+                service=self.service,
+            ).model_dump()
+
+        self.assertTrue(payload["success"])
+        self.assertEqual(payload["attempts"][0]["channel"], "wechat")
+        self.assertEqual(payload["attempts"][0]["latency_ms"], 42)
+        mock_test.assert_called_once()
+        self.assertEqual(mock_test.call_args.kwargs["channel"], "wechat")
+        self.assertEqual(mock_test.call_args.kwargs["timeout_seconds"], 5)
 
     def test_validate_returns_user_facing_model_message_without_internal_env_key_name(self) -> None:
         validation = self.service.validate(

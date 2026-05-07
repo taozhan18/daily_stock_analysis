@@ -216,6 +216,7 @@ def parse_arguments() -> argparse.Namespace:
   python main.py --single-notify    # 启用单股推送模式（每分析完一只立即推送）
   python main.py --schedule         # 启用定时任务模式
   python main.py --market-review    # 仅运行大盘复盘
+  python main.py --screener         # 运行全市场股票筛选
         '''
     )
 
@@ -328,6 +329,41 @@ def parse_arguments() -> argparse.Namespace:
         '--no-context-snapshot',
         action='store_true',
         help='不保存分析上下文快照'
+    )
+
+    # === Backtest ===
+    # === Screener ===
+    parser.add_argument(
+        '--screener',
+        action='store_true',
+        help='运行全市场股票筛选（纯数值计算，无需 AI）'
+    )
+
+    parser.add_argument(
+        '--screener-top',
+        type=int,
+        default=30,
+        help='筛选返回 Top N 股票（默认 30）'
+    )
+
+    parser.add_argument(
+        '--screener-pool-size',
+        type=int,
+        default=500,
+        help='Layer 2 候选池大小（默认 500）'
+    )
+
+    parser.add_argument(
+        '--screener-workers',
+        type=int,
+        default=5,
+        help='Layer 2 并发拉取线程数（默认 5）'
+    )
+
+    parser.add_argument(
+        '--screener-analyze',
+        action='store_true',
+        help='全市场筛选 + AI 深度分析（先筛选 Top N，再对筛选出的股票运行 AI 分析）'
     )
 
     # === Backtest ===
@@ -819,6 +855,72 @@ def main() -> int:
             )
             return 0
 
+        # 模式0: 全市场筛选
+        if getattr(args, 'screener', False):
+            from src.core.screener import StockScreener
+            from src.services.screener_service import ScreenerService
+
+            logger.info("模式: 全市场股票筛选")
+            top_n = getattr(args, 'screener_top', 30)
+            pool_size = getattr(args, 'screener_pool_size', 500)
+            workers = getattr(args, 'screener_workers', 5)
+            svc = ScreenerService()
+            result = svc.run_screener(top_n=top_n, layer2_pool_size=pool_size, max_workers=workers)
+
+            report = svc.format_report(result)
+            print(report)
+
+            if not args.no_notify:
+                try:
+                    from src.notification import NotificationService
+                    notifier = NotificationService()
+                    notifier.send(report)
+                except Exception as exc:
+                    logger.warning("筛选报告通知发送失败: %s", exc)
+
+            logger.info(
+                "筛选完成: 全市场 %d → 粗筛 %d → 精筛 %d → Top %d, 耗时 %.1fs",
+                result.total_market, result.layer1_passed,
+                result.layer2_passed, len(result.top_stocks),
+                result.elapsed_seconds,
+            )
+            return 0
+
+        # 模式0b: 全市场筛选 + AI 深度分析
+        if getattr(args, 'screener_analyze', False):
+            from src.core.screener import StockScreener
+            from src.services.screener_service import ScreenerService
+
+            logger.info("模式: 全市场筛选 + AI 深度分析")
+            top_n = getattr(args, 'screener_top', 10)
+            pool_size = getattr(args, 'screener_pool_size', 300)
+            workers = getattr(args, 'screener_workers', 5)
+
+            svc = ScreenerService()
+            result = svc.run_screener(top_n=top_n, layer2_pool_size=pool_size, max_workers=workers)
+
+            # 发送筛选摘要报告
+            report = svc.format_report(result)
+            print(report)
+            if not args.no_notify:
+                try:
+                    from src.notification import NotificationService
+                    notifier = NotificationService()
+                    notifier.send(report)
+                except Exception as exc:
+                    logger.warning("筛选报告通知发送失败: %s", exc)
+
+            if not result.top_stocks:
+                logger.info("筛选无结果，跳过 AI 分析")
+                return 0
+
+            screened_codes = [s.code for s in result.top_stocks]
+            logger.info("筛选完成，开始 AI 分析: %s", screened_codes)
+
+            # 对筛选出的股票运行完整 AI 分析流程
+            run_full_analysis(config, args, stock_codes=screened_codes)
+            return 0
+
         # 模式1: 仅大盘复盘
         if args.market_review:
             from src.analyzer import GeminiAnalyzer
@@ -900,6 +1002,35 @@ def main() -> int:
             def scheduled_task():
                 runtime_config = _reload_runtime_config()
                 run_full_analysis(runtime_config, args, scheduled_stock_codes)
+
+                # 定时附加：筛选股 AI 分析
+                screener_daily = os.environ.get("SCREENER_DAILY_ENABLED", "true").lower() in ("true", "1", "yes")
+                if screener_daily:
+                    try:
+                        from src.services.screener_service import ScreenerService
+                        logger.info("[Schedule] 开始附加筛选分析...")
+                        pool_size = int(os.environ.get("SCREENER_LAYER2_POOL_SIZE", "300"))
+                        top_n = int(os.environ.get("SCREENER_TOP_N", "10"))
+                        workers = int(os.environ.get("SCREENER_MAX_WORKERS", "5"))
+                        svc = ScreenerService()
+                        result = svc.run_screener(top_n=top_n, layer2_pool_size=pool_size, max_workers=workers)
+
+                        if result.top_stocks:
+                            screened_codes = [s.code for s in result.top_stocks]
+                            logger.info("[Schedule] 筛选完成: %s，开始 AI 分析", screened_codes)
+
+                            report = svc.format_report(result)
+                            try:
+                                from src.notification import NotificationService
+                                NotificationService().send(report)
+                            except Exception:
+                                pass
+
+                            run_full_analysis(runtime_config, args, stock_codes=screened_codes)
+                        else:
+                            logger.info("[Schedule] 筛选无结果，跳过 AI 分析")
+                    except Exception as exc:
+                        logger.error("[Schedule] 筛选分析异常: %s", exc)
 
             background_tasks = []
             if getattr(config, 'agent_event_monitor_enabled', False):

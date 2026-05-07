@@ -15,6 +15,8 @@ on:
         type: choice
         options:
           - full          # 完整分析（股票+大盘）
+          - full-with-screener  # 完整分析 + 筛选股分析
+          - screener-only # 仅筛选股分析
           - market-only   # 仅大盘复盘
           - stocks-only   # 仅股票分析
       force_run:
@@ -32,7 +34,7 @@ jobs:
   analyze:
     runs-on: ubuntu-latest
     # 添加超时限制，防止任务卡死
-    timeout-minutes: ${{ fromJSON(vars.ANALYSIS_TIMEOUT_MINUTES || '30') }}
+    timeout-minutes: ${{ fromJSON(vars.ANALYSIS_TIMEOUT_MINUTES || '120') }}
     
     steps:
       - name: 随机延迟（避免固定时间访问）
@@ -331,6 +333,15 @@ jobs:
           # 可选值: tencent, akshare_sina, efinance, akshare_em, tushare
           # 如果有 Tushare Pro 高积分账号，可将 tushare 放在首位
           REALTIME_SOURCE_PRIORITY: ${{ vars.REALTIME_SOURCE_PRIORITY || 'tencent,akshare_sina,efinance,akshare_em' }}
+
+          # ==========================================
+          # 筛选器配置
+          # ==========================================
+          SCREENER_LAYER2_POOL_SIZE: ${{ vars.SCREENER_LAYER2_POOL_SIZE || '300' }}
+          SCREENER_MAX_WORKERS: ${{ vars.SCREENER_MAX_WORKERS || '5' }}
+          SCREENER_TOP_N: ${{ vars.SCREENER_TOP_N || '10' }}
+          # 每日定时任务是否自动附加筛选分析（true/false）
+          SCREENER_DAILY_ENABLED: ${{ vars.SCREENER_DAILY_ENABLED || 'true' }}
           
         run: |
           # 处理 LITELLM YAML 配置文件
@@ -406,13 +417,47 @@ jobs:
             echo "⚡ 已启用强制运行模式（跳过交易日检查）"
           fi
 
+          # 判断是否为定时触发（无 mode 输入）
+          IS_SCHEDULE="${{ github.event_name == 'schedule' }}"
+
           # 执行分析
           if [ "$MODE" = "market-only" ]; then
             python main.py --market-review $FORCE_RUN_ARG
           elif [ "$MODE" = "stocks-only" ]; then
             python main.py --no-market-review $FORCE_RUN_ARG
-          else
+          elif [ "$MODE" = "screener-only" ]; then
+            echo ""
+            echo "=========================================="
+            echo "🔍 全市场筛选 → AI 分析"
+            echo "=========================================="
+            echo "筛选参数: pool=$SCREENER_LAYER2_POOL_SIZE, top=$SCREENER_TOP_N, workers=$SCREENER_MAX_WORKERS"
+            python main.py --screener-analyze --screener-top "$SCREENER_TOP_N" --screener-pool-size "$SCREENER_LAYER2_POOL_SIZE" --screener-workers "$SCREENER_MAX_WORKERS" $FORCE_RUN_ARG
+          elif [ "$MODE" = "full-with-screener" ]; then
+            echo ""
+            echo "=========================================="
+            echo "📊 步骤1: 自选股分析"
+            echo "=========================================="
             python main.py $FORCE_RUN_ARG
+
+            echo ""
+            echo "=========================================="
+            echo "🔍 步骤2: 全市场筛选 → AI 分析"
+            echo "=========================================="
+            echo "筛选参数: pool=$SCREENER_LAYER2_POOL_SIZE, top=$SCREENER_TOP_N, workers=$SCREENER_MAX_WORKERS"
+            python main.py --screener-analyze --screener-top "$SCREENER_TOP_N" --screener-pool-size "$SCREENER_LAYER2_POOL_SIZE" --screener-workers "$SCREENER_MAX_WORKERS" --no-market-review $FORCE_RUN_ARG
+          else
+            # 默认 full 模式
+            python main.py $FORCE_RUN_ARG
+
+            # 定时触发时，自动附加筛选分析
+            if [ "$IS_SCHEDULE" = "true" ] && [ "${SCREENER_DAILY_ENABLED,,}" = "true" ]; then
+              echo ""
+              echo "=========================================="
+              echo "🔍 定时附加: 全市场筛选 → AI 分析"
+              echo "=========================================="
+              echo "筛选参数: pool=$SCREENER_LAYER2_POOL_SIZE, top=$SCREENER_TOP_N, workers=$SCREENER_MAX_WORKERS"
+              python main.py --screener-analyze --screener-top "$SCREENER_TOP_N" --screener-pool-size "$SCREENER_LAYER2_POOL_SIZE" --screener-workers "$SCREENER_MAX_WORKERS" --no-market-review $FORCE_RUN_ARG
+            fi
           fi
       
       - name: 上传分析报告

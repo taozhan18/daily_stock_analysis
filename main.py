@@ -42,6 +42,7 @@ if os.getenv("GITHUB_ACTIONS") != "true" and os.getenv("USE_PROXY", "false").low
     os.environ["https_proxy"] = proxy_url
 
 import argparse
+import copy
 import logging
 import sys
 import time
@@ -443,6 +444,47 @@ def _compute_trading_day_filter(
 
     should_skip_all = (not filtered_codes) and (effective_region or '') == ''
     return (filtered_codes, effective_region, should_skip_all)
+
+
+def _run_screener_and_analyze(config, args):
+    """执行全市场筛选 + AI 深度分析（如果启用）。"""
+    screener_daily = os.environ.get("SCREENER_DAILY_ENABLED", "true").lower() in ("true", "1", "yes")
+    if not screener_daily:
+        return
+
+    try:
+        from src.services.screener_service import ScreenerService
+        pool_size = int(os.environ.get("SCREENER_LAYER2_POOL_SIZE", "300"))
+        top_n = int(os.environ.get("SCREENER_TOP_N", "10"))
+        workers = int(os.environ.get("SCREENER_MAX_WORKERS", "5"))
+
+        logger.info("[Screener] 开始全市场筛选 (pool=%d, top=%d, workers=%d)...", pool_size, top_n, workers)
+        svc = ScreenerService()
+        result = svc.run_screener(top_n=top_n, layer2_pool_size=pool_size, max_workers=workers)
+
+        # 发送筛选摘要
+        report = svc.format_report(result)
+        print(report)
+        if not args.no_notify:
+            try:
+                from src.notification import NotificationService
+                NotificationService().send(report)
+            except Exception as exc:
+                logger.warning("[Screener] 筛选报告通知发送失败: %s", exc)
+
+        if not result.top_stocks:
+            logger.info("[Screener] 筛选无结果，跳过 AI 分析")
+            return
+
+        screened_codes = [s.code for s in result.top_stocks]
+        logger.info("[Screener] 筛选完成: %s，开始 AI 分析", screened_codes)
+
+        # 对筛选出的股票运行 AI 分析（跳过大盘复盘，避免重复）
+        args_copy = copy.copy(args)
+        args_copy.no_market_review = True
+        run_full_analysis(config, args_copy, stock_codes=screened_codes)
+    except Exception as exc:
+        logger.error("[Screener] 筛选分析异常: %s", exc)
 
 
 def run_full_analysis(
@@ -1019,35 +1061,7 @@ def main() -> int:
             def scheduled_task():
                 runtime_config = _reload_runtime_config()
                 run_full_analysis(runtime_config, args, scheduled_stock_codes)
-
-                # 定时附加：筛选股 AI 分析
-                screener_daily = os.environ.get("SCREENER_DAILY_ENABLED", "true").lower() in ("true", "1", "yes")
-                if screener_daily:
-                    try:
-                        from src.services.screener_service import ScreenerService
-                        logger.info("[Schedule] 开始附加筛选分析...")
-                        pool_size = int(os.environ.get("SCREENER_LAYER2_POOL_SIZE", "300"))
-                        top_n = int(os.environ.get("SCREENER_TOP_N", "10"))
-                        workers = int(os.environ.get("SCREENER_MAX_WORKERS", "5"))
-                        svc = ScreenerService()
-                        result = svc.run_screener(top_n=top_n, layer2_pool_size=pool_size, max_workers=workers)
-
-                        if result.top_stocks:
-                            screened_codes = [s.code for s in result.top_stocks]
-                            logger.info("[Schedule] 筛选完成: %s，开始 AI 分析", screened_codes)
-
-                            report = svc.format_report(result)
-                            try:
-                                from src.notification import NotificationService
-                                NotificationService().send(report)
-                            except Exception:
-                                pass
-
-                            run_full_analysis(runtime_config, args, stock_codes=screened_codes)
-                        else:
-                            logger.info("[Schedule] 筛选无结果，跳过 AI 分析")
-                    except Exception as exc:
-                        logger.error("[Schedule] 筛选分析异常: %s", exc)
+                _run_screener_and_analyze(runtime_config, args)
 
             background_tasks = []
             if getattr(config, 'agent_event_monitor_enabled', False):
@@ -1083,6 +1097,7 @@ def main() -> int:
         # 模式3: 正常单次运行
         if config.run_immediately:
             run_full_analysis(config, args, stock_codes)
+            _run_screener_and_analyze(config, args)
         else:
             logger.info("配置为不立即运行分析 (RUN_IMMEDIATELY=false)")
 

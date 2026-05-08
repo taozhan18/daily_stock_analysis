@@ -441,44 +441,19 @@ jobs:
           # 判断是否为定时触发（无 mode 输入）
           IS_SCHEDULE="${{ github.event_name == 'schedule' }}"
 
-          # 执行分析
+          # 筛选器参数（供 screener-only / full-with-screener 使用）
+          echo "筛选器参数: pool=$SCREENER_LAYER2_POOL_SIZE, top=$SCREENER_TOP_N, workers=$SCREENER_MAX_WORKERS"
+
+          # 执行分析（筛选逻辑已内置到 main.py，SCREENER_DAILY_ENABLED=true 时自动附加）
           if [ "$MODE" = "market-only" ]; then
             python main.py --market-review $FORCE_RUN_ARG
           elif [ "$MODE" = "stocks-only" ]; then
             python main.py --no-market-review $FORCE_RUN_ARG
           elif [ "$MODE" = "screener-only" ]; then
-            echo ""
-            echo "=========================================="
-            echo "🔍 全市场筛选 → AI 分析"
-            echo "=========================================="
-            echo "筛选参数: pool=$SCREENER_LAYER2_POOL_SIZE, top=$SCREENER_TOP_N, workers=$SCREENER_MAX_WORKERS"
-            python main.py --screener-analyze --screener-top "$SCREENER_TOP_N" --screener-pool-size "$SCREENER_LAYER2_POOL_SIZE" --screener-workers "$SCREENER_MAX_WORKERS" $FORCE_RUN_ARG
-          elif [ "$MODE" = "full-with-screener" ]; then
-            echo ""
-            echo "=========================================="
-            echo "📊 步骤1: 自选股分析"
-            echo "=========================================="
-            python main.py $FORCE_RUN_ARG
-
-            echo ""
-            echo "=========================================="
-            echo "🔍 步骤2: 全市场筛选 → AI 分析"
-            echo "=========================================="
-            echo "筛选参数: pool=$SCREENER_LAYER2_POOL_SIZE, top=$SCREENER_TOP_N, workers=$SCREENER_MAX_WORKERS"
-            python main.py --screener-analyze --screener-top "$SCREENER_TOP_N" --screener-pool-size "$SCREENER_LAYER2_POOL_SIZE" --screener-workers "$SCREENER_MAX_WORKERS" --no-market-review $FORCE_RUN_ARG
+            SCREENER_DAILY_ENABLED=false python main.py --screener-analyze --screener-top "$SCREENER_TOP_N" --screener-pool-size "$SCREENER_LAYER2_POOL_SIZE" --screener-workers "$SCREENER_MAX_WORKERS" $FORCE_RUN_ARG
           else
-            # 默认 full 模式
+            # full / full-with-screener / 定时触发: 全部走 python main.py（内部自动处理）
             python main.py $FORCE_RUN_ARG
-
-            # 定时触发时，自动附加筛选分析
-            if [ "$IS_SCHEDULE" = "true" ] && [ "${SCREENER_DAILY_ENABLED,,}" = "true" ]; then
-              echo ""
-              echo "=========================================="
-              echo "🔍 定时附加: 全市场筛选 → AI 分析"
-              echo "=========================================="
-              echo "筛选参数: pool=$SCREENER_LAYER2_POOL_SIZE, top=$SCREENER_TOP_N, workers=$SCREENER_MAX_WORKERS"
-              python main.py --screener-analyze --screener-top "$SCREENER_TOP_N" --screener-pool-size "$SCREENER_LAYER2_POOL_SIZE" --screener-workers "$SCREENER_MAX_WORKERS" --no-market-review $FORCE_RUN_ARG
-            fi
           fi
       
       - name: 上传分析报告

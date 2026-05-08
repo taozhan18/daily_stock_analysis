@@ -1060,8 +1060,8 @@ def main() -> int:
 
             def scheduled_task():
                 runtime_config = _reload_runtime_config()
-                run_full_analysis(runtime_config, args, scheduled_stock_codes)
                 _run_screener_and_analyze(runtime_config, args)
+                run_full_analysis(runtime_config, args, scheduled_stock_codes)
 
             background_tasks = []
             if getattr(config, 'agent_event_monitor_enabled', False):
@@ -1096,8 +1096,9 @@ def main() -> int:
 
         # 模式3: 正常单次运行
         if config.run_immediately:
-            run_full_analysis(config, args, stock_codes)
+            # 先跑筛选器（拉取 efinance 全市场数据并缓存），再跑自选股分析（可复用缓存）
             _run_screener_and_analyze(config, args)
+            run_full_analysis(config, args, stock_codes)
         else:
             logger.info("配置为不立即运行分析 (RUN_IMMEDIATELY=false)")
 

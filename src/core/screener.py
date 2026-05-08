@@ -131,27 +131,59 @@ class StockScreener:
     # ── Layer 1: 实时数据粗筛 ─────────────────────────────────
 
     def _fetch_batch_realtime(self) -> Optional[pd.DataFrame]:
-        """通过 efinance 一次拉全市场实时行情 DataFrame。"""
+        """通过 efinance / akshare 拉全市场实时行情 DataFrame（带重试）。"""
+        max_retries = 3
+
+        # 1. 尝试复用 EfinanceFetcher 的缓存机制
         try:
+            from data_provider.efinance_fetcher import _realtime_cache, _ef_call_with_timeout
             import efinance as ef
-            logger.info("[Screener] 调用 ef.stock.get_realtime_quotes()...")
-            df = ef.stock.get_realtime_quotes()
-            if df is not None and not df.empty:
-                logger.info("[Screener] efinance 返回 %d 只股票", len(df))
-                return df
-        except Exception as exc:
-            logger.warning("[Screener] efinance 批量获取失败: %s", exc)
+            current_time = time.time()
+            if (
+                _realtime_cache.get('data') is not None
+                and current_time - _realtime_cache.get('timestamp', 0) < _realtime_cache.get('ttl', 600)
+            ):
+                cached_df = _realtime_cache['data']
+                if cached_df is not None and not cached_df.empty:
+                    logger.info("[Screener] 复用 efinance 缓存: %d 只股票", len(cached_df))
+                    return cached_df
+        except Exception:
+            pass
 
-        try:
-            import akshare as ak
-            logger.info("[Screener] 调用 ak.stock_zh_a_spot_em()...")
-            df = ak.stock_zh_a_spot_em()
-            if df is not None and not df.empty:
-                logger.info("[Screener] akshare 返回 %d 只股票", len(df))
-                return df
-        except Exception as exc:
-            logger.error("[Screener] akshare 批量获取失败: %s", exc)
+        # 2. efinance 重试
+        for attempt in range(1, max_retries + 1):
+            try:
+                import efinance as ef
+                from data_provider.efinance_fetcher import _ef_call_with_timeout
+                logger.info("[Screener] 调用 ef.stock.get_realtime_quotes()... (第%d次)", attempt)
+                df = _ef_call_with_timeout(ef.stock.get_realtime_quotes)
+                if df is not None and not df.empty:
+                    logger.info("[Screener] efinance 返回 %d 只股票", len(df))
+                    return df
+                logger.warning("[Screener] efinance 返回空数据")
+            except Exception as exc:
+                logger.warning("[Screener] efinance 批量获取失败 (第%d次): %s", attempt, exc)
 
+            if attempt < max_retries:
+                time.sleep(5 * attempt)
+
+        # 3. akshare 重试
+        for attempt in range(1, max_retries + 1):
+            try:
+                import akshare as ak
+                logger.info("[Screener] 调用 ak.stock_zh_a_spot_em()... (第%d次)", attempt)
+                df = ak.stock_zh_a_spot_em()
+                if df is not None and not df.empty:
+                    logger.info("[Screener] akshare 返回 %d 只股票", len(df))
+                    return df
+                logger.warning("[Screener] akshare 返回空数据")
+            except Exception as exc:
+                logger.warning("[Screener] akshare 批量获取失败 (第%d次): %s", attempt, exc)
+
+            if attempt < max_retries:
+                time.sleep(5 * attempt)
+
+        logger.error("[Screener] 所有数据源重试均失败")
         return None
 
     def _normalize_columns(self, df: pd.DataFrame) -> pd.DataFrame:

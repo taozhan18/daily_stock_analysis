@@ -23,6 +23,11 @@ WORKDIR /app
 ENV TZ=Asia/Shanghai
 RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
+RUN sed -i 's|http://deb.debian.org/debian|https://mirrors.ustc.edu.cn/debian|g' /etc/apt/sources.list.d/debian.sources || true && \
+    sed -i 's|http://deb.debian.org/debian|https://mirrors.ustc.edu.cn/debian|g' /etc/apt/sources.list || true && \
+    sed -i 's|http://deb.debian.org/debian-security|https://mirrors.ustc.edu.cn/debian-security|g' /etc/apt/sources.list.d/debian.sources || true && \
+    sed -i 's|http://deb.debian.org/debian-security|https://mirrors.ustc.edu.cn/debian-security|g' /etc/apt/sources.list || true
+
 # 安装系统依赖（wkhtmltopdf 含 wkhtmltoimage，用于 Markdown 转图片 Issue #289）
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
@@ -56,7 +61,8 @@ COPY --from=web-builder /app/static ./static/
 
 # 确保数据目录存在并授权给 non-root 用户
 RUN mkdir -p /app/data /app/logs /app/reports && \
-    chown -R dsa:dsa /app
+    chown -R dsa:dsa /app && \
+    chown -R dsa:dsa /usr/local/lib/python3.11/site-packages/efinance
 
 # 设置环境变量默认值
 ENV PYTHONUNBUFFERED=1

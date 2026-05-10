@@ -530,3 +530,236 @@ class AkshareFundamentalAdapter:
         result["status"] = "ok"
         result["source_chain"].append(f"dragon_tiger:{source}")
         return result
+
+
+class TushareFundamentalAdapter:
+    """Tushare Pro adapter for fundamentals, capital flow and dragon-tiger signals.
+
+    Uses Tushare's standard API (fina_indicator, income, moneyflow, etc.)
+    which is more stable and feature-rich than AkShare web scraping.
+    Requires TUSHARE_TOKEN with 2000+ points for full functionality.
+    """
+
+    def __init__(self) -> None:
+        self._client = None
+        self._init_client()
+
+    def _init_client(self) -> None:
+        try:
+            from data_provider.tushare_fetcher import _TushareHttpClient
+            import os
+            token = os.environ.get("TUSHARE_TOKEN", "").strip()
+            if token:
+                self._client = _TushareHttpClient(token=token, timeout=15)
+        except Exception as exc:
+            logger.warning("TushareFundamentalAdapter init failed: %s", exc)
+
+    def _ts_code(self, stock_code: str) -> str:
+        """Convert stock code to Tushare ts_code format."""
+        code = _normalize_code(stock_code)
+        if code.startswith(('6',)):
+            return f"{code}.SH"
+        elif code.startswith(('0', '3')):
+            return f"{code}.SZ"
+        elif code.startswith(('4', '8')):
+            return f"{code}.BJ"
+        return f"{code}.SZ"
+
+    def _query(self, api_name: str, **kwargs) -> Optional[pd.DataFrame]:
+        if self._client is None:
+            return None
+        try:
+            df = self._client.query(api_name, **kwargs)
+            return df if df is not None and not df.empty else None
+        except Exception as exc:
+            logger.debug("Tushare %s failed: %s", api_name, exc)
+            return None
+
+    def get_fundamental_bundle(self, stock_code: str) -> Dict[str, Any]:
+        """Return fundamental blocks from Tushare Pro APIs."""
+        result: Dict[str, Any] = {
+            "status": "not_supported",
+            "growth": {},
+            "earnings": {},
+            "institution": {},
+            "source_chain": [],
+            "errors": [],
+        }
+        ts_code = self._ts_code(stock_code)
+
+        # 1. fina_indicator — 130+ pre-computed financial ratios
+        fina_df = self._query("fina_indicator", ts_code=ts_code)
+        if fina_df is not None:
+            row = fina_df.sort_values("end_date", ascending=False).iloc[0] if "end_date" in fina_df.columns else fina_df.iloc[0]
+            result["growth"] = {
+                "revenue_yoy": _safe_float(row.get("or_yoy")),
+                "net_profit_yoy": _safe_float(row.get("netprofit_yoy")),
+                "roe": _safe_float(row.get("roe")),
+                "gross_margin": _safe_float(row.get("grossprofit_margin")),
+                "net_margin": _safe_float(row.get("netprofit_margin")),
+                "roa": _safe_float(row.get("roa")),
+                "roic": _safe_float(row.get("roic")),
+                "debt_to_assets": _safe_float(row.get("debt_to_assets")),
+                "current_ratio": _safe_float(row.get("current_ratio")),
+                "quick_ratio": _safe_float(row.get("quick_ratio")),
+            }
+            result["earnings"]["financial_report"] = {
+                "report_date": str(row.get("end_date", ""))[:10] if row.get("end_date") else None,
+                "eps": _safe_float(row.get("eps")),
+                "bps": _safe_float(row.get("bps")),
+                "revenue": _safe_float(row.get("rev_op")),
+                "net_profit_parent": _safe_float(row.get("netprofit_margin")),
+                "operating_cash_flow": _safe_float(row.get("ocf_or")),
+                "roe": _safe_float(row.get("roe")),
+            }
+            result["source_chain"].append("growth:tushare_fina_indicator")
+
+        # 2. income — revenue, net profit detail
+        income_df = self._query("income", ts_code=ts_code)
+        if income_df is not None:
+            row = income_df.sort_values("end_date", ascending=False).iloc[0] if "end_date" in income_df.columns else income_df.iloc[0]
+            report = result["earnings"].get("financial_report", {})
+            if not report.get("revenue"):
+                report["revenue"] = _safe_float(row.get("total_revenue"))
+            if not report.get("net_profit_parent"):
+                report["net_profit_parent"] = _safe_float(row.get("n_income_attr_p"))
+            report["ebitda"] = _safe_float(row.get("ebitda"))
+            report["rd_expense"] = _safe_float(row.get("rd_exp"))
+            result["earnings"]["financial_report"] = report
+            result["source_chain"].append("income:tushare_income")
+
+        # 3. forecast — earnings guidance
+        forecast_df = self._query("forecast", ts_code=ts_code)
+        if forecast_df is not None:
+            row = forecast_df.sort_values("ann_date", ascending=False).iloc[0] if "ann_date" in forecast_df.columns else forecast_df.iloc[0]
+            result["earnings"]["forecast_summary"] = _safe_str(row.get("summary")) or _safe_str(row.get("type"))
+            if row.get("p_change_min") or row.get("p_change_max"):
+                result["earnings"]["forecast_range"] = {
+                    "min_pct": _safe_float(row.get("p_change_min")),
+                    "max_pct": _safe_float(row.get("p_change_max")),
+                }
+            result["source_chain"].append("forecast:tushare_forecast")
+
+        # 4. express — earnings quick report
+        express_df = self._query("express", ts_code=ts_code)
+        if express_df is not None:
+            row = express_df.sort_values("ann_date", ascending=False).iloc[0] if "ann_date" in express_df.columns else express_df.iloc[0]
+            result["earnings"]["quick_report_summary"] = (
+                f"营收:{row.get('revenue', 'N/A')} 净利润:{row.get('n_income', 'N/A')} "
+                f"YOY:{row.get('yoy_net_profit', 'N/A')}%"
+            )[:200]
+            result["source_chain"].append("express:tushare_express")
+
+        # 5. stk_holdernumber — shareholder concentration
+        holder_df = self._query("stk_holdernumber", ts_code=ts_code)
+        if holder_df is not None and len(holder_df) >= 2:
+            sorted_df = holder_df.sort_values("end_date", ascending=False)
+            latest = sorted_df.iloc[0]
+            prev = sorted_df.iloc[1]
+            latest_num = _safe_float(latest.get("holder_num"))
+            prev_num = _safe_float(prev.get("holder_num"))
+            if latest_num and prev_num:
+                change_pct = round((latest_num - prev_num) / prev_num * 100, 2)
+                result["institution"]["holder_num_change_pct"] = change_pct
+                result["institution"]["holder_num"] = int(latest_num)
+            result["source_chain"].append("holder:tushare_stk_holdernumber")
+
+        # 6. dividend
+        dividend_df = self._query("dividend", ts_code=ts_code)
+        if dividend_df is not None:
+            events = []
+            for _, row in dividend_df.head(5).iterrows():
+                cash = _safe_float(row.get("cash_div_tax"))
+                if cash and cash > 0:
+                    events.append({
+                        "event_date": str(row.get("end_date", ""))[:10],
+                        "cash_dividend_per_share": cash,
+                        "is_pre_tax": True,
+                    })
+            if events:
+                # Compute TTM
+                now_date = datetime.now().date()
+                ttm_start = now_date - timedelta(days=365)
+                ttm_total = sum(e["cash_dividend_per_share"] for e in events
+                                if e["event_date"] and e["event_date"] >= ttm_start.isoformat())
+                result["earnings"]["dividend"] = {
+                    "events": events,
+                    "ttm_cash_dividend_per_share": ttm_total or None,
+                }
+                result["source_chain"].append("dividend:tushare_dividend")
+
+        has_content = bool(result["growth"] or result["earnings"] or result["institution"])
+        result["status"] = "partial" if has_content else "not_supported"
+        return result
+
+    def get_capital_flow(self, stock_code: str, top_n: int = 5) -> Dict[str, Any]:
+        """Return stock capital flow from Tushare moneyflow."""
+        result: Dict[str, Any] = {
+            "status": "not_supported",
+            "stock_flow": {},
+            "sector_rankings": {"top": [], "bottom": []},
+            "source_chain": [],
+            "errors": [],
+        }
+        ts_code = self._ts_code(stock_code)
+
+        # Individual stock money flow
+        flow_df = self._query("moneyflow", ts_code=ts_code)
+        if flow_df is not None:
+            row = flow_df.sort_values("trade_date", ascending=False).iloc[0] if "trade_date" in flow_df.columns else flow_df.iloc[0]
+            result["stock_flow"] = {
+                "main_net_inflow": _safe_float(row.get("net_mf_amount")),
+                "buy_lg_amount": _safe_float(row.get("buy_lg_amount")),
+                "sell_lg_amount": _safe_float(row.get("sell_lg_amount")),
+                "buy_elg_amount": _safe_float(row.get("buy_elg_amount")),
+                "sell_elg_amount": _safe_float(row.get("sell_elg_amount")),
+            }
+            result["source_chain"].append("capital_stock:tushare_moneyflow")
+
+        # Northbound capital
+        hsgt_df = self._query("moneyflow_hsgt")
+        if hsgt_df is not None:
+            row = hsgt_df.sort_values("trade_date", ascending=False).iloc[0] if "trade_date" in hsgt_df.columns else hsgt_df.iloc[0]
+            result["stock_flow"]["north_money"] = _safe_float(row.get("north_money"))
+            result["source_chain"].append("north:tushare_moneyflow_hsgt")
+
+        has_content = bool(result["stock_flow"])
+        result["status"] = "partial" if has_content else "not_supported"
+        return result
+
+    def get_dragon_tiger_flag(self, stock_code: str, lookback_days: int = 20) -> Dict[str, Any]:
+        """Return dragon-tiger signal from Tushare top_list."""
+        result: Dict[str, Any] = {
+            "status": "not_supported",
+            "is_on_list": False,
+            "recent_count": 0,
+            "latest_date": None,
+            "source_chain": [],
+            "errors": [],
+        }
+        ts_code = self._ts_code(stock_code)
+
+        top_df = self._query("top_list", ts_code=ts_code)
+        if top_df is None:
+            return result
+
+        now = datetime.now()
+        start = now - timedelta(days=max(1, lookback_days))
+
+        if "trade_date" in top_df.columns:
+            parsed_dates = []
+            for val in top_df["trade_date"].astype(str).tolist():
+                try:
+                    parsed_dates.append(pd.to_datetime(val).to_pydatetime())
+                except Exception:
+                    continue
+            recent_dates = [d for d in parsed_dates if start <= d <= now]
+            result["is_on_list"] = bool(recent_dates)
+            result["recent_count"] = len(recent_dates)
+            result["latest_date"] = max(recent_dates).date().isoformat() if recent_dates else (
+                max(parsed_dates).date().isoformat() if parsed_dates else None
+            )
+
+        result["status"] = "ok"
+        result["source_chain"].append("dragon_tiger:tushare_top_list")
+        return result

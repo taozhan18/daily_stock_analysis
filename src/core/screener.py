@@ -131,60 +131,188 @@ class StockScreener:
     # ── Layer 1: 实时数据粗筛 ─────────────────────────────────
 
     def _fetch_batch_realtime(self) -> Optional[pd.DataFrame]:
-        """通过 efinance / akshare 拉全市场实时行情 DataFrame（带重试）。"""
+        """通过多种数据源拉全市场实时行情 DataFrame（带重试）。
+
+        数据源优先级：
+          - SCREENER_SOURCE_PRIORITY 环境变量可控制，默认 "tushare,efinance,akshare"
+          - 有 TUSHARE_TOKEN 时 Tushare 优先（不受东方财富封IP影响）
+        """
         max_retries = 3
 
-        # 1. 尝试复用 EfinanceFetcher 的缓存机制
-        try:
-            from data_provider.efinance_fetcher import _realtime_cache, _ef_call_with_timeout
-            import efinance as ef
-            current_time = time.time()
-            if (
-                _realtime_cache.get('data') is not None
-                and current_time - _realtime_cache.get('timestamp', 0) < _realtime_cache.get('ttl', 600)
-            ):
-                cached_df = _realtime_cache['data']
-                if cached_df is not None and not cached_df.empty:
-                    logger.info("[Screener] 复用 efinance 缓存: %d 只股票", len(cached_df))
-                    return cached_df
-        except Exception:
-            pass
+        # 解析数据源优先级
+        priority_str = os.environ.get("SCREENER_SOURCE_PRIORITY", "tushare,efinance,akshare")
+        source_order = [s.strip().lower() for s in priority_str.split(",")]
 
-        # 2. efinance 重试
-        for attempt in range(1, max_retries + 1):
-            try:
-                import efinance as ef
-                from data_provider.efinance_fetcher import _ef_call_with_timeout
-                logger.info("[Screener] 调用 ef.stock.get_realtime_quotes()... (第%d次)", attempt)
-                df = _ef_call_with_timeout(ef.stock.get_realtime_quotes)
+        for source in source_order:
+            if source == "tushare":
+                df = self._fetch_via_tushare()
                 if df is not None and not df.empty:
-                    logger.info("[Screener] efinance 返回 %d 只股票", len(df))
                     return df
-                logger.warning("[Screener] efinance 返回空数据")
-            except Exception as exc:
-                logger.warning("[Screener] efinance 批量获取失败 (第%d次): %s", attempt, exc)
 
-            if attempt < max_retries:
-                time.sleep(5 * attempt)
+            elif source == "efinance":
+                # 尝试复用 EfinanceFetcher 的缓存机制
+                try:
+                    from data_provider.efinance_fetcher import _realtime_cache
+                    current_time = time.time()
+                    if (
+                        _realtime_cache.get('data') is not None
+                        and current_time - _realtime_cache.get('timestamp', 0) < _realtime_cache.get('ttl', 600)
+                    ):
+                        cached_df = _realtime_cache['data']
+                        if cached_df is not None and not cached_df.empty:
+                            logger.info("[Screener] 复用 efinance 缓存: %d 只股票", len(cached_df))
+                            return cached_df
+                except Exception:
+                    pass
 
-        # 3. akshare 重试
-        for attempt in range(1, max_retries + 1):
-            try:
-                import akshare as ak
-                logger.info("[Screener] 调用 ak.stock_zh_a_spot_em()... (第%d次)", attempt)
-                df = ak.stock_zh_a_spot_em()
-                if df is not None and not df.empty:
-                    logger.info("[Screener] akshare 返回 %d 只股票", len(df))
-                    return df
-                logger.warning("[Screener] akshare 返回空数据")
-            except Exception as exc:
-                logger.warning("[Screener] akshare 批量获取失败 (第%d次): %s", attempt, exc)
+                for attempt in range(1, max_retries + 1):
+                    try:
+                        import efinance as ef
+                        from data_provider.efinance_fetcher import _ef_call_with_timeout
+                        logger.info("[Screener] 调用 ef.stock.get_realtime_quotes()... (第%d次)", attempt)
+                        df = _ef_call_with_timeout(ef.stock.get_realtime_quotes)
+                        if df is not None and not df.empty:
+                            logger.info("[Screener] efinance 返回 %d 只股票", len(df))
+                            return df
+                        logger.warning("[Screener] efinance 返回空数据")
+                    except Exception as exc:
+                        logger.warning("[Screener] efinance 批量获取失败 (第%d次): %s", attempt, exc)
+                    if attempt < max_retries:
+                        time.sleep(5 * attempt)
 
-            if attempt < max_retries:
-                time.sleep(5 * attempt)
+            elif source == "akshare":
+                for attempt in range(1, max_retries + 1):
+                    try:
+                        import akshare as ak
+                        logger.info("[Screener] 调用 ak.stock_zh_a_spot_em()... (第%d次)", attempt)
+                        df = ak.stock_zh_a_spot_em()
+                        if df is not None and not df.empty:
+                            logger.info("[Screener] akshare 返回 %d 只股票", len(df))
+                            return df
+                        logger.warning("[Screener] akshare 返回空数据")
+                    except Exception as exc:
+                        logger.warning("[Screener] akshare 批量获取失败 (第%d次): %s", attempt, exc)
+                    if attempt < max_retries:
+                        time.sleep(5 * attempt)
 
         logger.error("[Screener] 所有数据源重试均失败")
         return None
+
+    def _fetch_via_tushare(self) -> Optional[pd.DataFrame]:
+        """通过 Tushare Pro 按交易日拉全市场日线数据（不走东方财富，不受IP封禁影响）。
+
+        使用 daily(trade_date=...) 一次获取所有股票当日数据，
+        再用 stk_factorpro 获取 PE/市值/换手率等。
+        """
+        tushare_token = os.environ.get("TUSHARE_TOKEN", "").strip()
+        if not tushare_token:
+            logger.info("[Screener] Tushare: 未配置 TUSHARE_TOKEN，跳过")
+            return None
+
+        try:
+            from data_provider.tushare_fetcher import _TushareHttpClient
+            client = _TushareHttpClient(token=tushare_token, timeout=30)
+        except Exception as exc:
+            logger.warning("[Screener] Tushare 客户端初始化失败: %s", exc)
+            return None
+
+        # 确定最近交易日
+        from datetime import datetime, timedelta
+        today = datetime.now()
+        # Tushare daily 在盘后才更新，盘中可能没有当天数据，往前尝试3天
+        for days_back in range(0, 4):
+            check_date = today - timedelta(days=days_back)
+            trade_date = check_date.strftime("%Y%m%d")
+            try:
+                logger.info("[Screener] Tushare: 尝试 trade_date=%s", trade_date)
+                df = client.query("daily", trade_date=trade_date)
+                if df is None or df.empty:
+                    continue
+
+                logger.info("[Screener] Tushare daily 返回 %d 条记录", len(df))
+
+                # 获取股票基本信息（名称）
+                stock_info = None
+                try:
+                    stock_info = client.query("stock_basic", exchange="", list_status="L", fields="ts_code,name,industry")
+                except Exception:
+                    pass
+
+                # 尝试获取 PE/市值/换手率（stk_factorpro 需要较高积分）
+                factor_df = None
+                try:
+                    factor_df = client.query("stk_factorpro", trade_date=trade_date)
+                except Exception:
+                    # 降级: 尝试 stk_factor
+                    try:
+                        factor_df = client.query("stk_factor", trade_date=trade_date)
+                    except Exception:
+                        pass
+
+                # 合并数据
+                df = self._merge_tushare_data(df, stock_info, factor_df)
+                if df is not None and not df.empty:
+                    logger.info("[Screener] Tushare 合并后 %d 只股票", len(df))
+                    return df
+
+            except Exception as exc:
+                logger.warning("[Screener] Tushare trade_date=%s 失败: %s", trade_date, exc)
+
+        logger.warning("[Screener] Tushare 所有日期均失败")
+        return None
+
+    @staticmethod
+    def _merge_tushare_data(daily_df: pd.DataFrame,
+                            stock_info: Optional[pd.DataFrame],
+                            factor_df: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
+        """将 Tushare daily / stock_basic / stk_factorpro 合并为统一格式。"""
+        # daily 返回: ts_code, trade_date, open, high, low, close, pre_close, change, pct_chg, vol, amount
+        result = daily_df.copy()
+        result["code"] = result["ts_code"].str.replace(r"\.(SH|SZ|BJ)$", "", regex=True)
+
+        if stock_info is not None and not stock_info.empty:
+            name_map = dict(zip(stock_info["ts_code"], stock_info["name"]))
+            result["name"] = result["ts_code"].map(name_map)
+        else:
+            result["name"] = ""
+
+        # 重命名列以匹配 _normalize_columns
+        result = result.rename(columns={
+            "close": "price",
+            "pct_chg": "change_pct",
+            "vol": "volume",
+            "open": "open_price",
+        })
+
+        # amount 单位是千元，转元
+        if "amount" in result.columns:
+            result["amount"] = result["amount"] * 1000
+
+        # 合并 factor 数据（PE/市值/换手率）
+        if factor_df is not None and not factor_df.empty and "ts_code" in factor_df.columns:
+            merge_cols = ["ts_code"]
+            factor_rename = {}
+            if "pe_ttm" in factor_df.columns:
+                factor_rename["pe_ttm"] = "pe_ratio"
+            elif "pe" in factor_df.columns:
+                factor_rename["pe"] = "pe_ratio"
+            if "total_mv" in factor_df.columns:
+                factor_rename["total_mv"] = "total_mv"
+            if "turnover_rate" in factor_df.columns:
+                factor_rename["turnover_rate"] = "turnover_rate"
+            if "volume_ratio" in factor_df.columns:
+                factor_rename["volume_ratio"] = "volume_ratio"
+
+            if factor_rename:
+                factor_subset = factor_df[merge_cols + list(factor_rename.keys())].copy()
+                factor_subset = factor_subset.rename(columns=factor_rename)
+                result = result.merge(factor_subset, on="ts_code", how="left")
+
+        # 总市值单位是万元，转亿元
+        if "total_mv" in result.columns:
+            result["total_mv"] = result["total_mv"] / 10000
+
+        return result
 
     def _normalize_columns(self, df: pd.DataFrame) -> pd.DataFrame:
         """统一中文/英文列名为标准英文名。"""
@@ -321,7 +449,97 @@ class StockScreener:
         return scored
 
     def _fetch_daily_histories(self, codes: List[str]) -> Dict[str, Optional[pd.DataFrame]]:
-        """并发批量拉取日K线，通过 data_provider 管理器。"""
+        """批量拉取日K线。优先尝试 Tushare 批量接口，失败降级到逐股并发。"""
+        # 1. 尝试 Tushare 批量获取（一次 API 调用获取所有股票的 60 天数据）
+        tushare_result = self._fetch_histories_via_tushare(codes)
+        if tushare_result is not None:
+            missing = [c for c in codes if c not in tushare_result or tushare_result[c] is None]
+            if len(missing) < len(codes) * 0.3:  # 成功率 > 70% 就用 Tushare 结果
+                if missing:
+                    logger.info("[Screener] Tushare 批量K线缺少 %d 只，逐股补充", len(missing))
+                    fallback = self._fetch_histories_via_manager(missing)
+                    for code, df in fallback.items():
+                        if df is not None:
+                            tushare_result[code] = df
+                return tushare_result
+
+        # 2. 降级：逐股并发获取
+        return self._fetch_histories_via_manager(codes)
+
+    def _fetch_histories_via_tushare(self, codes: List[str]) -> Optional[Dict[str, Optional[pd.DataFrame]]]:
+        """通过 Tushare daily 批量获取 60 天K线（按日期逐天拉全市场）。"""
+        tushare_token = os.environ.get("TUSHARE_TOKEN", "").strip()
+        if not tushare_token:
+            return None
+
+        try:
+            from data_provider.tushare_fetcher import _TushareHttpClient
+            client = _TushareHttpClient(token=tushare_token, timeout=30)
+        except Exception:
+            return None
+
+        from datetime import datetime, timedelta
+
+        # 找到最近的交易日，往前拉 60 天
+        # 先获取交易日历
+        try:
+            today_str = datetime.now().strftime("%Y%m%d")
+            cal_df = client.query("trade_cal", exchange="SSE", start_date=(datetime.now() - timedelta(days=120)).strftime("%Y%m%d"), end_date=today_str, is_open="1")
+            if cal_df is None or cal_df.empty:
+                return None
+            trade_dates = sorted(cal_df["cal_date"].tolist())[-60:]
+        except Exception as exc:
+            logger.warning("[Screener] Tushare 获取交易日历失败: %s", exc)
+            return None
+
+        # Tushare 每分钟调用次数有限，批量拉取每天的全市场数据
+        code_set = set(codes)
+        all_data: Dict[str, List[dict]] = {}
+
+        for i, trade_date in enumerate(trade_dates):
+            try:
+                if i > 0 and i % 200 == 0:
+                    time.sleep(60)  # Tushare 频率限制：每分钟 200 次
+                df = client.query("daily", trade_date=trade_date)
+                if df is None or df.empty:
+                    continue
+                for _, row in df.iterrows():
+                    code = row["ts_code"].split(".")[0] if "." in str(row["ts_code"]) else str(row["ts_code"])
+                    if code in code_set:
+                        if code not in all_data:
+                            all_data[code] = []
+                        all_data[code].append(row.to_dict())
+            except Exception as exc:
+                logger.warning("[Screener] Tushare daily trade_date=%s 失败: %s", trade_date, exc)
+                continue
+
+        if not all_data:
+            return None
+
+        # 转换为 DataFrame
+        results: Dict[str, Optional[pd.DataFrame]] = {}
+        for code in codes:
+            if code in all_data and len(all_data[code]) >= 20:
+                df = pd.DataFrame(all_data[code])
+                df = df.sort_values("trade_date")
+                # 标准化列名
+                if "close" not in df.columns:
+                    pass
+                else:
+                    if "vol" in df.columns:
+                        df["volume"] = df["vol"]
+                    if "amount" in df.columns:
+                        df["amount"] = df["amount"] * 1000  # 千元→元
+                    results[code] = df
+            else:
+                results[code] = None
+
+        fetched = sum(1 for v in results.values() if v is not None)
+        logger.info("[Screener] Tushare 批量K线: %d/%d 成功", fetched, len(codes))
+        return results
+
+    def _fetch_histories_via_manager(self, codes: List[str]) -> Dict[str, Optional[pd.DataFrame]]:
+        """逐股并发拉取日K线，通过 data_provider 管理器。"""
         try:
             from data_provider.base import DataFetcherManager
             manager = DataFetcherManager()

@@ -853,6 +853,10 @@ class Config:
     # === 基本面聚合开关与降级保护 ===
     # 全局总开关；关闭时返回 not_supported 并保持主流程无变化
     enable_fundamental_pipeline: bool = True
+    # 基本面数据源优先级（逗号分隔，可选: tushare, akshare）
+    # tushare: 数据更全面（130+ 指标），稳定 API，需 TUSHARE_TOKEN
+    # akshare: 免费爬虫，字段较少，可能因网站改版不稳定
+    fundamental_source_priority: str = "akshare"
     # 基本面阶段总预算（秒）
     fundamental_stage_timeout_seconds: float = 1.5
     # 单能力源调用超时（秒）
@@ -1579,6 +1583,7 @@ class Config:
             realtime_cache_ttl=parse_env_int(os.getenv('REALTIME_CACHE_TTL'), 600, field_name='REALTIME_CACHE_TTL', minimum=0),
             circuit_breaker_cooldown=parse_env_int(os.getenv('CIRCUIT_BREAKER_COOLDOWN'), 300, field_name='CIRCUIT_BREAKER_COOLDOWN', minimum=0),
             enable_fundamental_pipeline=os.getenv('ENABLE_FUNDAMENTAL_PIPELINE', 'true').lower() == 'true',
+            fundamental_source_priority=cls._resolve_fundamental_source_priority(),
             fundamental_stage_timeout_seconds=parse_env_float(
                 os.getenv('FUNDAMENTAL_STAGE_TIMEOUT_SECONDS'),
                 1.5,
@@ -2118,6 +2123,28 @@ class Config:
             return resolved
 
         return default_priority
+
+    @classmethod
+    def _resolve_fundamental_source_priority(cls) -> str:
+        """
+        Resolve fundamental data source priority.
+
+        When TUSHARE_TOKEN is configured but FUNDAMENTAL_SOURCE_PRIORITY is not
+        explicitly set, default to 'tushare,akshare' so paid data is utilized.
+        """
+        explicit = os.getenv('FUNDAMENTAL_SOURCE_PRIORITY')
+        if explicit:
+            return explicit
+
+        tushare_token = os.getenv('TUSHARE_TOKEN', '').strip()
+        if tushare_token:
+            import logging
+            logging.getLogger(__name__).info(
+                "TUSHARE_TOKEN detected, auto-setting fundamental priority: tushare,akshare"
+            )
+            return 'tushare,akshare'
+
+        return 'akshare'
 
     @classmethod
     def reset_instance(cls) -> None:

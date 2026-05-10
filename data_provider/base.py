@@ -26,7 +26,7 @@ import pandas as pd
 import numpy as np
 from src.data.stock_index_loader import get_index_stock_name
 from src.data.stock_mapping import STOCK_NAME_MAP, is_meaningful_stock_name
-from .fundamental_adapter import AkshareFundamentalAdapter
+from .fundamental_adapter import AkshareFundamentalAdapter, TushareFundamentalAdapter
 
 # 配置日志
 logger = logging.getLogger(__name__)
@@ -504,6 +504,8 @@ class DataFetcherManager:
             # 默认数据源将在首次使用时延迟加载
             self._init_default_fetchers()
         self._fundamental_adapter = AkshareFundamentalAdapter()
+        self._fundamental_adapters: List[Any] = []  # ordered by priority
+        self._init_fundamental_adapters()
         self._tickflow_fetcher = None
         self._tickflow_api_key: Optional[str] = None
         self._tickflow_lock = RLock()
@@ -840,7 +842,36 @@ class DataFetcherManager:
             board_name = str(raw_data).strip()
             return [{"name": board_name}]
         return []
-    
+
+    def _init_fundamental_adapters(self) -> None:
+        """Initialize fundamental adapters ordered by configured priority."""
+        try:
+            from src.config import get_config
+            config = get_config()
+            priority = getattr(config, 'fundamental_source_priority', 'akshare').lower()
+        except Exception:
+            priority = 'akshare'
+
+        adapters_map = {
+            "tushare": lambda: TushareFundamentalAdapter(),
+            "akshare": lambda: AkshareFundamentalAdapter(),
+        }
+
+        for source in priority.split(','):
+            source = source.strip().lower()
+            factory = adapters_map.get(source)
+            if factory is None:
+                continue
+            try:
+                adapter = factory()
+                self._fundamental_adapters.append((source, adapter))
+                logger.info("[基本面] 注册数据源: %s", source)
+            except Exception as exc:
+                logger.warning("[基本面] 数据源 %s 初始化失败: %s", source, exc)
+
+        if not self._fundamental_adapters:
+            self._fundamental_adapters = [("akshare", self._fundamental_adapter)]
+
     def _init_default_fetchers(self) -> None:
         """
         初始化默认数据源列表
@@ -1962,6 +1993,91 @@ class DataFetcherManager:
             **blocks,
         }
 
+    def _call_fundamental_adapters(self, method_name: str, stock_code: str) -> Any:
+        """Call a method on fundamental adapters in priority order, merge results.
+
+        Tries each adapter in order. If the primary adapter returns partial data,
+        continues to next adapter to fill gaps. Returns the best merged result.
+        """
+        merged: Optional[Dict[str, Any]] = None
+        last_error: Optional[str] = None
+
+        for source_name, adapter in self._fundamental_adapters:
+            fn = getattr(adapter, method_name, None)
+            if fn is None:
+                continue
+            try:
+                result = fn(stock_code)
+                if not isinstance(result, dict):
+                    continue
+
+                status = result.get("status", "not_supported")
+                if status == "not_supported":
+                    continue
+
+                if merged is None:
+                    merged = result
+                else:
+                    # Merge: fill gaps from lower-priority adapter
+                    merged = self._merge_fundamental_results(merged, result, source_name)
+
+                # Check if we have enough data
+                has_growth = bool(merged.get("growth"))
+                has_earnings = bool(merged.get("earnings"))
+                if has_growth and has_earnings:
+                    merged["source_chain"] = merged.get("source_chain", [])
+                    return merged
+
+            except Exception as exc:
+                last_error = str(exc)
+                logger.debug("[基本面] %s %s failed: %s", source_name, method_name, exc)
+                continue
+
+        if merged is not None:
+            return merged
+
+        # All adapters failed, return empty result
+        return {
+            "status": "not_supported",
+            "growth": {},
+            "earnings": {},
+            "institution": {},
+            "source_chain": [],
+            "errors": [last_error] if last_error else ["all fundamental sources failed"],
+        }
+
+    @staticmethod
+    def _merge_fundamental_results(primary: Dict[str, Any], secondary: Dict[str, Any],
+                                    secondary_source: str) -> Dict[str, Any]:
+        """Merge secondary result into primary, only filling empty fields."""
+        for block_key in ("growth", "earnings", "institution"):
+            pri_block = primary.get(block_key, {})
+            sec_block = secondary.get(block_key, {})
+            if not isinstance(pri_block, dict) or not isinstance(sec_block, dict):
+                continue
+            for field, value in sec_block.items():
+                if field not in pri_block or not pri_block[field]:
+                    pri_block[field] = value
+            if pri_block:
+                primary[block_key] = pri_block
+
+        # Merge source chain
+        existing_chain = primary.get("source_chain", [])
+        new_chain = secondary.get("source_chain", [])
+        for entry in new_chain:
+            if entry not in existing_chain:
+                existing_chain.append(entry)
+        primary["source_chain"] = existing_chain
+
+        # Merge errors
+        existing_errors = primary.get("errors", [])
+        for err in secondary.get("errors", []):
+            if err not in existing_errors:
+                existing_errors.append(err)
+        primary["errors"] = existing_errors
+
+        return primary
+
     def get_fundamental_context(
         self,
         stock_code: str,
@@ -2072,7 +2188,7 @@ class DataFetcherManager:
         else:
             bundle_timeout = min(fetch_timeout, remaining_seconds)
             bundle_payload, bundle_err_msg, bundle_ms = self._run_with_retry(
-                lambda: self._fundamental_adapter.get_fundamental_bundle(stock_code),
+                lambda: self._call_fundamental_adapters("get_fundamental_bundle", stock_code),
                 bundle_timeout,
                 "fundamental_bundle",
             )
@@ -2288,7 +2404,7 @@ class DataFetcherManager:
                 ["fundamental stage timeout"],
             )
         payload, err, cost_ms = self._run_with_retry(
-            lambda: self._fundamental_adapter.get_capital_flow(stock_code),
+            lambda: self._call_fundamental_adapters("get_capital_flow", stock_code),
             timeout,
             "capital_flow",
         )
@@ -2352,7 +2468,7 @@ class DataFetcherManager:
                 ["fundamental stage timeout"],
             )
         payload, err, cost_ms = self._run_with_retry(
-            lambda: self._fundamental_adapter.get_dragon_tiger_flag(stock_code),
+            lambda: self._call_fundamental_adapters("get_dragon_tiger_flag", stock_code),
             timeout,
             "dragon_tiger",
         )

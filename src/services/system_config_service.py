@@ -1367,6 +1367,19 @@ class SystemConfigService:
                 )
             )
 
+        startup_only_bind_keys = submitted_keys & {
+            "WEBUI_HOST",
+            "WEBUI_PORT",
+        }
+        if startup_only_bind_keys:
+            warnings.append(
+                (
+                    f"{', '.join(sorted(startup_only_bind_keys))} 已写入 .env。"
+                    "这些属于启动期监听配置：当前已运行的 WebUI/API 进程不会因为本次保存重新绑定监听地址或端口；"
+                    "请重启当前进程、Docker 容器或服务管理器后生效。"
+                )
+            )
+
         return warnings
 
     @staticmethod
@@ -1606,6 +1619,31 @@ class SystemConfigService:
                     "actual": value,
                 }
             )
+
+        if "allowed_values" in validation and value:
+            delimiter = validation.get("delimiter")
+            raw_values = value.split(delimiter) if delimiter else [value]
+            allowed_values = {str(item).strip().lower() for item in validation["allowed_values"]}
+            invalid_values = []
+            seen_invalid = set()
+            for raw_item in raw_values:
+                item = raw_item.strip().lower()
+                if not item:
+                    continue
+                if item not in allowed_values and item not in seen_invalid:
+                    invalid_values.append(item)
+                    seen_invalid.add(item)
+            if invalid_values:
+                issues.append(
+                    {
+                        "key": key,
+                        "code": "invalid_allowed_value",
+                        "message": "Value contains unsupported item(s)",
+                        "severity": "error",
+                        "expected": ",".join(str(item) for item in validation["allowed_values"]),
+                        "actual": ", ".join(invalid_values),
+                    }
+                )
 
         if validation.get("item_type") == "url":
             delimiter = validation.get("delimiter", ",")
@@ -2558,7 +2596,7 @@ class SystemConfigService:
     @staticmethod
     def _classify_llm_http_error(status_code: int, error_text: str) -> _LLMDiagnostic:
         lowered = (error_text or "").lower()
-        if "model" in lowered and any(token in lowered for token in ("not authorized", "not allowed", "access denied", "permission denied")):
+        if SystemConfigService._has_model_access_denied_signal(error_text or ""):
             return _LLMDiagnostic(
                 "model_not_found",
                 False,
@@ -2572,8 +2610,6 @@ class SystemConfigService:
                 "Configured model could not be found on this channel",
                 "model_not_found",
             )
-        if status_code in {401, 403} or any(token in lowered for token in ("unauthorized", "forbidden", "invalid api key", "authentication")):
-            return _LLMDiagnostic("auth", False, "LLM authentication failed", "api_key_rejected")
         if status_code == 402 or any(token in lowered for token in ("billing", "balance", "insufficient balance")):
             return _LLMDiagnostic(
                 "quota",
@@ -2595,6 +2631,22 @@ class SystemConfigService:
                 "LLM request was rejected by quota or rate limiting",
                 "rate_limit",
             )
+        if SystemConfigService._has_transport_blocked_signal(error_text or ""):
+            return _LLMDiagnostic(
+                "network_error",
+                True,
+                "LLM request failed before a valid response was returned",
+                "network_error",
+            )
+        if SystemConfigService._has_request_blocked_signal(error_text or ""):
+            return _LLMDiagnostic(
+                "request_blocked",
+                False,
+                "LLM request was blocked by provider or gateway policy",
+                "provider_blocked",
+            )
+        if status_code in {401, 403} or any(token in lowered for token in ("unauthorized", "forbidden", "invalid api key", "authentication")):
+            return _LLMDiagnostic("auth", False, "LLM authentication failed", "api_key_rejected")
         if status_code == 404:
             return _LLMDiagnostic(
                 "network_error",
@@ -2631,6 +2683,60 @@ class SystemConfigService:
                 return True
 
         return False
+
+    @staticmethod
+    def _has_model_access_denied_signal(text: str) -> bool:
+        lowered = text.lower()
+        if "model" not in lowered:
+            return False
+
+        # Best-effort classifier for observed provider messages. Keep it gated by
+        # an explicit "model" mention plus access/disabled/unavailable signals so
+        # unrelated provider-specific failures continue to use the fallback path.
+        access_denied_tokens = (
+            "not authorized",
+            "not allowed",
+            "access denied",
+            "permission denied",
+            "model disabled",
+            "model is disabled",
+            "disabled model",
+            "model has been disabled",
+            "model not enabled",
+            "model not available",
+            "model is not available",
+        )
+        return any(token in lowered for token in access_denied_tokens)
+
+    @staticmethod
+    def _has_request_blocked_signal(text: str) -> bool:
+        lowered = text.lower()
+        if SystemConfigService._has_transport_blocked_signal(lowered):
+            return False
+        blocked_tokens = (
+            "your request was blocked",
+            "the request was blocked",
+            "request blocked by policy",
+            "blocked by policy",
+            "blocked due to policy",
+            "moderation_blocked",
+            "policy_blocked",
+            "请求被拦截",
+        )
+        return any(token in lowered for token in blocked_tokens)
+
+    @staticmethod
+    def _has_transport_blocked_signal(text: str) -> bool:
+        lowered = text.lower()
+        transport_tokens = (
+            "connection blocked",
+            "connection request was blocked",
+            "network blocked",
+            "blocked by network policy",
+            "blocked by firewall",
+            "firewall blocked",
+        )
+        return any(token in lowered for token in transport_tokens)
 
     @staticmethod
     def _has_provider_prefix_mismatch_signal(text: str) -> bool:
@@ -2679,12 +2785,19 @@ class SystemConfigService:
                 "Configured model prefix does not match this channel",
                 "provider_prefix_mismatch",
             )
-        if "model" in text and any(token in text for token in ("not authorized", "not allowed", "access denied", "permission denied")):
+        if SystemConfigService._has_model_access_denied_signal(str(exc)):
             return _LLMDiagnostic(
                 "model_not_found",
                 False,
                 "Configured model is not available for this channel",
                 "model_access_denied",
+            )
+        if SystemConfigService._has_request_blocked_signal(str(exc)):
+            return _LLMDiagnostic(
+                "request_blocked",
+                False,
+                "LLM request was blocked by provider or gateway policy",
+                "provider_blocked",
             )
         if any(token in exc_name for token in ("auth", "permission")) or any(token in text for token in ("unauthorized", "forbidden", "invalid api key", "authentication")):
             return _LLMDiagnostic("auth", False, "LLM authentication failed", "api_key_rejected")
@@ -2703,7 +2816,9 @@ class SystemConfigService:
             return _LLMDiagnostic("network_error", True, "LLM request failed before a valid response was returned", "connection_refused")
         if "ssl" in text or "tls" in text or "certificate" in text:
             return _LLMDiagnostic("network_error", True, "LLM request failed before a valid response was returned", "tls_error")
-        if any(token in exc_name for token in ("connection", "network")) or any(token in text for token in ("connection", "network")):
+        if any(token in exc_name for token in ("connection", "network")) or any(
+            token in text for token in ("connection", "network", "firewall")
+        ):
             return _LLMDiagnostic("network_error", True, "LLM request failed before a valid response was returned", "network_error")
         return _LLMDiagnostic("network_error", False, "LLM channel test failed", "unknown_error")
 

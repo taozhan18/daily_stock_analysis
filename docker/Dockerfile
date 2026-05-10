@@ -37,6 +37,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libjpeg62-turbo \
     libxrender1 \
     libxext6 \
+    gosu \
     && rm -rf /var/lib/apt/lists/*
 
 # 创建非 root 用户 (UID 1000)
@@ -64,6 +65,10 @@ RUN mkdir -p /app/data /app/logs /app/reports && \
     chown -R dsa:dsa /app && \
     chown -R dsa:dsa /usr/local/lib/python3.11/site-packages/efinance
 
+# 复制 entrypoint 脚本
+COPY docker/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
 # 设置环境变量默认值
 ENV PYTHONUNBUFFERED=1
 ENV LOG_DIR=/app/logs
@@ -72,19 +77,18 @@ ENV DATABASE_PATH=/app/data/stock_analysis.db
 ENV WEBUI_HOST=0.0.0.0
 ENV API_PORT=8000
 
-# 切换到 non-root 用户
-USER dsa
+# 数据卷（持久化数据）
+VOLUME ["/app/data", "/app/logs", "/app/reports"]
 
 # 暴露 API 端口
 EXPOSE 8000
-
-# 数据卷（持久化数据）
-VOLUME ["/app/data", "/app/logs", "/app/reports"]
 
 # 健康检查（FastAPI 模式）
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
     CMD curl -f http://localhost:8000/api/health || curl -f http://localhost:8000/health \
     || python -c "import sys; sys.exit(0)"
+
+ENTRYPOINT ["/entrypoint.sh"]
 
 # 默认命令（可被覆盖）
 CMD ["python", "main.py", "--schedule"]

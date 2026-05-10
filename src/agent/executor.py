@@ -624,6 +624,8 @@ class AgentExecutor:
 
         if parse_dashboard and loop_result.success:
             dashboard = parse_dashboard_json(loop_result.content)
+            if dashboard is None and loop_result.content:
+                dashboard = self._retry_dashboard_parse(messages, loop_result.content)
             return AgentResult(
                 success=dashboard is not None,
                 content=loop_result.content,
@@ -647,6 +649,30 @@ class AgentExecutor:
             model=model_str,
             error=loop_result.error,
         )
+
+    def _retry_dashboard_parse(self, messages: List[Dict[str, Any]], previous_content: str, max_retries: int = 1) -> Optional[Dict[str, Any]]:
+        """Re-prompt the LLM to fix its dashboard JSON when parsing fails."""
+        for attempt in range(max_retries):
+            logger.info("Dashboard JSON parse failed, retrying with correction prompt (attempt %d/%d)", attempt + 1, max_retries)
+            retry_messages = list(messages) + [
+                {"role": "assistant", "content": previous_content},
+                {"role": "user", "content": "你上次的回复中决策仪表盘JSON格式有误，无法解析。请只输出一个完整的、合法的JSON对象（包含 decision_dashboard 字段），不要输出任何其他内容。"},
+            ]
+            retry_result = run_agent_loop(
+                messages=retry_messages,
+                tool_registry=self.tool_registry,
+                llm_adapter=self.llm_adapter,
+                max_steps=1,
+                max_wall_clock_seconds=60,
+            )
+            if retry_result.success and retry_result.content:
+                dashboard = parse_dashboard_json(retry_result.content)
+                if dashboard is not None:
+                    logger.info("Dashboard JSON retry succeeded on attempt %d", attempt + 1)
+                    return dashboard
+                previous_content = retry_result.content
+        logger.warning("Dashboard JSON retry exhausted after %d attempts", max_retries)
+        return None
 
     def _build_user_message(self, task: str, context: Optional[Dict[str, Any]] = None) -> str:
         """Build the initial user message."""

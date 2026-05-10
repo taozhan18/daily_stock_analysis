@@ -1097,9 +1097,14 @@ def main() -> int:
 
         # 模式3: 正常单次运行
         if config.run_immediately:
-            # 先跑筛选器（拉取 efinance 全市场数据并缓存），再跑自选股分析（可复用缓存）
-            _run_screener_and_analyze(config, args)
-            run_full_analysis(config, args, stock_codes)
+            # 指定了 --stocks 时只分析指定股票，跳过全市场筛选和大盘复盘
+            if stock_codes:
+                args_copy = copy.copy(args)
+                args_copy.no_market_review = True
+                run_full_analysis(config, args_copy, stock_codes)
+            else:
+                _run_screener_and_analyze(config, args)
+                run_full_analysis(config, args, stock_codes)
         else:
             logger.info("配置为不立即运行分析 (RUN_IMMEDIATELY=false)")
 

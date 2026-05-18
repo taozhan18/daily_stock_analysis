@@ -362,7 +362,7 @@ jobs:
           SCREENER_MAX_WORKERS: ${{ vars.SCREENER_MAX_WORKERS || '5' }}
           SCREENER_TOP_N: ${{ vars.SCREENER_TOP_N || '10' }}
           # 每日定时任务是否自动附加筛选分析（true/false）
-          SCREENER_DAILY_ENABLED: ${{ vars.SCREENER_DAILY_ENABLED || 'true' }}
+          SCREENER_DAILY_ENABLED: ${{ vars.SCREENER_DAILY_ENABLED || 'false' }}
           
         run: |
           # 处理 LITELLM YAML 配置文件

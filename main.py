@@ -480,10 +480,20 @@ def _run_screener_and_analyze(config, args):
         screened_codes = [s.code for s in result.top_stocks]
         logger.info("[Screener] 筛选完成: %s，开始 AI 分析", screened_codes)
 
+        # 构建筛选器技术面提示（客观事实，不含主观推荐）
+        screener_hints = {}
+        for s in result.top_stocks:
+            parts = [f"综合评分: {s.score:.0f}/100"]
+            if s.match_reasons:
+                parts.append("匹配信号: " + "、".join(s.match_reasons))
+            if s.indicators:
+                parts.append("分项指标: " + ", ".join(f"{k}={v:.2f}" for k, v in s.indicators.items() if isinstance(v, (int, float))))
+            screener_hints[s.code] = "; ".join(parts)
+
         # 对筛选出的股票运行 AI 分析（跳过大盘复盘，避免重复）
         args_copy = copy.copy(args)
         args_copy.no_market_review = True
-        run_full_analysis(config, args_copy, stock_codes=screened_codes)
+        run_full_analysis(config, args_copy, stock_codes=screened_codes, screener_hints=screener_hints)
     except Exception as exc:
         logger.error("[Screener] 筛选分析异常: %s", exc)
 
@@ -512,7 +522,8 @@ def _run_market_review_with_shared_lock(
 def run_full_analysis(
     config: Config,
     args: argparse.Namespace,
-    stock_codes: Optional[List[str]] = None
+    stock_codes: Optional[List[str]] = None,
+    screener_hints: Optional[Dict[str, str]] = None,
 ):
     """
     执行完整的分析流程（个股 + 大盘复盘）
@@ -574,7 +585,8 @@ def run_full_analysis(
             stock_codes=stock_codes,
             dry_run=args.dry_run,
             send_notification=not args.no_notify,
-            merge_notification=merge_notification
+            merge_notification=merge_notification,
+            screener_hints=screener_hints,
         )
 
         # Issue #128: 分析间隔 - 在个股分析和大盘分析之间添加延迟
@@ -1003,8 +1015,18 @@ def main() -> int:
             screened_codes = [s.code for s in result.top_stocks]
             logger.info("筛选完成，开始 AI 分析: %s", screened_codes)
 
+            # 构建筛选器技术面提示
+            screener_hints = {}
+            for s in result.top_stocks:
+                parts = [f"综合评分: {s.score:.0f}/100"]
+                if s.match_reasons:
+                    parts.append("匹配信号: " + "、".join(s.match_reasons))
+                if s.indicators:
+                    parts.append("分项指标: " + ", ".join(f"{k}={v:.2f}" for k, v in s.indicators.items() if isinstance(v, (int, float))))
+                screener_hints[s.code] = "; ".join(parts)
+
             # 对筛选出的股票运行完整 AI 分析流程
-            run_full_analysis(config, args, stock_codes=screened_codes)
+            run_full_analysis(config, args, stock_codes=screened_codes, screener_hints=screener_hints)
             return 0
 
         # 模式1: 仅大盘复盘

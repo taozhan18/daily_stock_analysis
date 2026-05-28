@@ -241,7 +241,7 @@ class StockAnalysisPipeline:
             logger.error(f"{stock_name}({code}) {error_msg}")
             return False, error_msg
     
-    def analyze_stock(self, code: str, report_type: ReportType, query_id: str) -> Optional[AnalysisResult]:
+    def analyze_stock(self, code: str, report_type: ReportType, query_id: str, screener_hint: Optional[str] = None) -> Optional[AnalysisResult]:
         """
         分析单只股票（增强版：含量比、换手率、筹码分析、多维度情报）
         
@@ -382,6 +382,7 @@ class StockAnalysisPipeline:
                     chip_data,
                     fundamental_context,
                     trend_result,
+                    screener_hint=screener_hint,
                 )
 
             # Step 4: 多维度情报搜索（最新消息+风险排查+业绩预期）
@@ -769,15 +770,16 @@ class StockAnalysisPipeline:
             logger.warning("[%s] Agent history prefetch failed: %s", code, e)
 
     def _analyze_with_agent(
-        self, 
-        code: str, 
-        report_type: ReportType, 
+        self,
+        code: str,
+        report_type: ReportType,
         query_id: str,
         stock_name: str,
         realtime_quote: Any,
         chip_data: Optional[ChipDistribution],
         fundamental_context: Optional[Dict[str, Any]] = None,
         trend_result: Optional[TrendAnalysisResult] = None,
+        screener_hint: Optional[str] = None,
     ) -> Optional[AnalysisResult]:
         """
         使用 Agent 模式分析单只股票。
@@ -804,6 +806,8 @@ class StockAnalysisPipeline:
                 initial_context["chip_distribution"] = self._safe_to_dict(chip_data)
             if trend_result:
                 initial_context["trend_result"] = self._safe_to_dict(trend_result)
+            if screener_hint:
+                initial_context["screener_hint"] = screener_hint
 
             # Agent path: inject social sentiment as news_context so both
             # executor (_build_user_message) and orchestrator (ctx.set_data)
@@ -1605,6 +1609,7 @@ class StockAnalysisPipeline:
         report_type: ReportType = ReportType.SIMPLE,
         analysis_query_id: Optional[str] = None,
         current_time: Optional[datetime] = None,
+        screener_hint: Optional[str] = None,
     ) -> Optional[AnalysisResult]:
         """
         处理单只股票的完整流程
@@ -1652,7 +1657,7 @@ class StockAnalysisPipeline:
                 return None
             
             effective_query_id = analysis_query_id or self.query_id or uuid.uuid4().hex
-            result = self.analyze_stock(code, report_type, query_id=effective_query_id)
+            result = self.analyze_stock(code, report_type, query_id=effective_query_id, screener_hint=screener_hint)
             
             if result and result.success:
                 logger.info(
@@ -1686,7 +1691,8 @@ class StockAnalysisPipeline:
         stock_codes: Optional[List[str]] = None,
         dry_run: bool = False,
         send_notification: bool = True,
-        merge_notification: bool = False
+        merge_notification: bool = False,
+        screener_hints: Optional[Dict[str, str]] = None,
     ) -> List[AnalysisResult]:
         """
         运行完整的分析流程
@@ -1770,6 +1776,7 @@ class StockAnalysisPipeline:
                     report_type=report_type,  # Issue #119: 传递报告类型
                     analysis_query_id=uuid.uuid4().hex,
                     current_time=resume_reference_time,
+                    screener_hint=screener_hints.get(code) if screener_hints else None,
                 ): code
                 for code in stock_codes
             }

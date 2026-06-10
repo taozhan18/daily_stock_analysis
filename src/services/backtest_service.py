@@ -37,6 +37,7 @@ class BacktestService:
         eval_window_days: Optional[int] = None,
         min_age_days: Optional[int] = None,
         limit: int = 200,
+        advice_filter: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         config = get_config()
 
@@ -61,6 +62,7 @@ class BacktestService:
             eval_window_days=int(eval_window_days),
             engine_version=str(engine_version),
             force=force,
+            advice_filter=advice_filter,
         )
 
         processed = 0

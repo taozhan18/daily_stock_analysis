@@ -33,7 +33,6 @@ class BacktestRepository:
         eval_window_days: int,
         engine_version: str,
         force: bool,
-        advice_filter: Optional[List[str]] = None,
     ) -> List[AnalysisHistory]:
         """Return AnalysisHistory rows eligible for backtest."""
         cutoff_dt = datetime.now() - timedelta(days=min_age_days)
@@ -42,14 +41,6 @@ class BacktestRepository:
             conditions = [AnalysisHistory.created_at <= cutoff_dt]
             if code:
                 conditions.append(AnalysisHistory.code == code)
-            if advice_filter:
-                # 只回测给定了指定操作建议的记录（如只回测"买入"信号）。
-                # 数据库可能存中文（买入）或英文（buy），用 LIKE 模糊匹配以兼容两种。
-                from sqlalchemy import or_
-                advice_clauses = []
-                for advice in advice_filter:
-                    advice_clauses.append(AnalysisHistory.operation_advice.ilike(f"%{advice}%"))
-                conditions.append(or_(*advice_clauses))
 
             query = select(AnalysisHistory).where(and_(*conditions))
 

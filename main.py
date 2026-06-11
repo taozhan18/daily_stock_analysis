@@ -402,13 +402,6 @@ def parse_arguments() -> argparse.Namespace:
         help='强制回测（即使已有回测结果也重新计算）'
     )
 
-    parser.add_argument(
-        '--backtest-advice',
-        type=str,
-        default=None,
-        help='只回测指定操作建议的记录，逗号分隔（如 "买入,buy"）'
-    )
-
     return parser.parse_args()
 
 
@@ -948,15 +941,11 @@ def main() -> int:
             logger.info("模式: 回测")
             from src.services.backtest_service import BacktestService
 
-            advice_raw = getattr(args, 'backtest_advice', None)
-            advice_filter = [a.strip() for a in advice_raw.split(',') if a.strip()] if advice_raw else None
-
             service = BacktestService()
             stats = service.run_backtest(
                 code=getattr(args, 'backtest_code', None),
                 force=getattr(args, 'backtest_force', False),
                 eval_window_days=getattr(args, 'backtest_days', None),
-                advice_filter=advice_filter,
             )
             logger.info(
                 f"回测完成: processed={stats.get('processed')} saved={stats.get('saved')} "
